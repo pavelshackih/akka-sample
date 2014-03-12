@@ -18,7 +18,7 @@ object EntryPoint extends App {
   class Master(n: Int) extends Actor {
 
     var cluster = new collection.mutable.ArrayBuffer[ActorRef]()
-    for (i <- 0 to n) {
+    for (i <- 0 until n) {
       cluster += context.actorOf(Props[Node])
     }
 
