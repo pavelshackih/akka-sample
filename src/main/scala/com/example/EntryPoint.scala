@@ -1,99 +1,137 @@
 package com.example
 
 import akka.actor._
-import scala.Some
 
 object EntryPoint extends App {
 
+  case class Start(n: Int)
+  case class SendToANode(message: Int)
+  case object Finished
+  case class Failure(exc: Exception)
+
   val system = ActorSystem("system")
 
-  val n = 16
-  val broadNodes = n / 2
+  val master = system.actorOf(Props[Master], name = "master")
+  master ! Start(8)
 
-  val randomUpperBound = 10
-  val random = util.Random
+  object Cluster {
 
-  def getRandom = random.nextInt(randomUpperBound)
+    var list: List[ActorRef] = Nil
 
-  val randomValues = 0 until n map(x => getRandom)
-  val expectedSum = randomValues.reduce(_ + _)
-  println(s"Expected sum: $expectedSum")
+    def apply(int: Int): ActorRef = list(int)
 
-  val listener = system.actorOf(Props(new Listener(n)), name = "listener")
+    def apply() = list
 
-  var cluster = new collection.mutable.ArrayBuffer[ActorRef]()
-  for (i <- 0 until n) {
-    cluster += system.actorOf(Props(new BiNode(listener, n, i)))
+    def build(context: ActorContext, n: Int, listener: ActorRef) {
+      var cluster = new collection.mutable.ArrayBuffer[ActorRef]()
+      for (i <- 0 until n) {
+        cluster += context.actorOf(Props(new NodeActor(Some(listener), n, i)))
+      }
+      list = cluster.toList
+    }
   }
 
-  // start calculating from childs that to parents
-  for (i <- (n - 1) to broadNodes by -1) {
-    cluster(i) ! SendToANode(0)
+  class Master extends Actor {
+
+    override def receive = {
+      case Start(n) =>
+        if (n < 1) {
+          context.sender ! Failure(new IllegalArgumentException(s"Node count should be positive"))
+        }
+        val broadNodes = n / 2
+        val listener = context.actorOf(Props(new ListenerActor(n)), name = "listener")
+        Cluster.build(context, n, listener)
+        for (i <- (n - 1) to broadNodes by -1) {
+          Cluster(i) ! SendToANode(0)
+        }
+        context stop self
+    }
   }
 
-  class BiNode(listener: ActorRef, val n: Int, id: Int) extends Actor with ActorLogging {
+  class NodeActor(listener: Option[ActorRef], val n: Int, val id: Int) extends Actor with ActorLogging with Node {
 
-    var i = randomValues(id)
-
-    val childs = new collection.mutable.HashMap[Child, ActorRef]
+    var i = RandomGenerator.getRandom
     var visited = 0
-
-    left.map(childs.put(Left, _))
-    right.map(childs.put(Right, _))
-    val hasParent = id != 0
-
     var globalSum = 0
-    var propagated = false
 
     override def receive = {
       case SendToANode(value) =>
         i += value
-        if (propagated) {
-          globalSum = value
-          log.info(s"Sum: $globalSum")
-          childs.values.foreach(_ ! SendToANode(globalSum))
-          fireSumUpdated()
-          context stop self
-        } else {
-          visited += 1
-          if (visited >= childs.size) { // waiting when both of childs returns they values
-            propagated = true
-            if (hasParent) {
-              parent.map(_ ! SendToANode(i))
-            } else {
-              // sum calculated, propagate value to childs
-              globalSum = i
-              log.info(s"Sum: $globalSum")
-              fireSumUpdated()
-              childs.values.foreach(_ ! SendToANode(globalSum))
-              context stop self
-            }
+        visited += 1
+        if (visited >= childCount) {
+          if (hasParent) {
+            parentRef.map(_ ! SendToANode(i))
+          } else {
+            globalSum = i
+            log.info(s"Sum: $globalSum")
+            fireSumUpdated()
+            sendToChilds(globalSum)
+            context stop self
           }
+          context become receiveResult
         }
     }
 
-    def fireSumUpdated() = listener ! Finished
+    def receiveResult: Receive = {
+      case SendToANode(value) =>
+        globalSum = value
+        log.info(s"Sum: $globalSum")
+        sendToChilds(globalSum)
+        fireSumUpdated()
+        context stop self
+    }
+
+    def sendToChilds(v: Int) {
+      leftRef.map(_ ! SendToANode(v))
+      rightRef.map(_ ! SendToANode(v))
+    }
+
+    def leftRef = if (left < 0) None else Some(Cluster(left))
+
+    def rightRef = if (right < 0) None else Some(Cluster(right))
+
+    def parentRef = if (hasParent) Some(Cluster(parent)) else None
+
+    def fireSumUpdated() = listener.map(_ ! Finished)
+  }
+
+  trait Node {
+
+    def n(): Int
+
+    def id(): Int
+
+    def globalSum(): Int
 
     def parent = {
       val inc = if (id % 2 == 0) 2 else 1
       val index = (id - inc) / 2
-      if (index > -1) Some(cluster(index)) else None
+      if (index > -1) index else -1
     }
 
     def left = {
       val ix = 2 * id + 1
-      if (ix > cluster.size - 1) None else Some(cluster(ix))
+      if (ix > n - 1) -1 else ix
     }
 
     def right = {
       val ix = 2 * id + 2
-      if (ix > cluster.size - 1) None else Some(cluster(ix))
+      if (ix > n - 1) -1 else ix
     }
 
-    def hasChilds = id < n / 2 + 1
+    def childCount = {
+      var childs = 0
+      if (left > -1) childs += 1
+      if (right > -1) childs += 1
+      childs
+    }
+
+    def hasParent = parent != -1
+
+    def hasChild = id < n / 2 + 1
   }
 
-  class Listener(n: Int) extends Actor with ActorLogging {
+  class ListenerActor(n: Int) extends Actor with ActorLogging {
 
     var counter = 0
 
@@ -101,16 +139,9 @@ object EntryPoint extends App {
       case Finished =>
         counter += 1
         if (counter == n) {
-          log.info("Completed")
-          system.shutdown()
+          log.info(s"Completed, expected sum: ${RandomGenerator.getActualSum}")
+          if (system != null) system.shutdown()
         }
     }
   }
-
-  case class SendToANode(message: Int)
-  case object Finished
-  trait Child
-  case object Left extends Child
-  case object Right extends Child
-
 }
